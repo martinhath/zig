@@ -32,9 +32,23 @@ prev_di_column: u32,
 /// Relative to the beginning of `code`.
 prev_di_pc: usize,
 
+code_offset_mapping: std.AutoHashMapUnmanaged(Mir.Inst.Index, usize) = .{},
+relocs: std.ArrayListUnmanaged(Reloc) = .{},
+
 const InnerError = error{
     OutOfMemory,
     EmitFail,
+};
+
+const Reloc = struct {
+    /// Offset of the instruction.
+    source: u64,
+    /// Target of the relocation.
+    target: Mir.Inst.Index,
+    /// Offset of the relocation within the instruction.
+    offset: u64,
+    /// Length of the instruction.
+    length: u5,
 };
 
 pub fn emitMir(emit: *Emit) InnerError!void {
@@ -42,6 +56,7 @@ pub fn emitMir(emit: *Emit) InnerError!void {
 
     for (mir_tags) |tag, index| {
         const inst = @intCast(u32, index);
+        try emit.code_offset_mapping.putNoClobber(emit.bin_file.allocator, inst, emit.code.items.len);
         switch (tag) {
             .adc => try emit.mirArith(.adc, inst),
             .add => try emit.mirArith(.add, inst),
@@ -122,6 +137,14 @@ pub fn emitMir(emit: *Emit) InnerError!void {
             },
         }
     }
+
+    try emit.fixupRelocs();
+}
+
+pub fn deinit(emit: *Emit) void {
+    emit.relocs.deinit(emit.bin_file.allocator);
+    emit.code_offset_mapping.deinit(emit.bin_file.allocator);
+    emit.* = undefined;
 }
 
 fn fail(emit: *Emit, comptime format: []const u8, args: anytype) InnerError {
@@ -129,6 +152,19 @@ fn fail(emit: *Emit, comptime format: []const u8, args: anytype) InnerError {
     assert(emit.err_msg == null);
     emit.err_msg = try ErrorMsg.create(emit.bin_file.allocator, emit.src_loc, format, args);
     return error.EmitFail;
+}
+
+fn fixupRelocs(emit: *Emit) InnerError!void {
+    // TODO this function currently assumes all relocs via JMP/CALL instructions are 32bit in size.
+    // This should be reversed like it is done in aarch64 MIR emit code: start with the smallest
+    // possible resolution, i.e., 8bit, and iteratively converge on the minimum required resolution
+    // until the entire decl is correctly emitted with all JMP/CALL instructions within range.
+    for (emit.relocs.items) |reloc| {
+        const target = emit.code_offset_mapping.get(reloc.target) orelse
+            return emit.fail("JMP/CALL relocation target not found!", .{});
+        const disp = @intCast(i32, @intCast(i64, target) - @intCast(i64, reloc.source + reloc.length));
+        mem.writeIntLittle(i32, emit.code.items[reloc.offset..][0..4], disp);
+    }
 }
 
 fn mirBrk(emit: *Emit) InnerError!void {
@@ -200,20 +236,23 @@ fn mirJmpCall(emit: *Emit, tag: Mir.Inst.Tag, inst: Mir.Inst.Index) InnerError!v
     const ops = Mir.Ops.decode(emit.mir.instructions.items(.ops)[inst]);
     const flag = @truncate(u1, ops.flags);
     if (flag == 0) {
-        // const imm = emit.mir.instructions.items(.data)[inst].imm;
-        // const opc: u8 = switch (tag) {
-        //     .jmp => if (imm <= math.maxInt(i8)) @as(u8, 0xeb) else 0xe9,
-        //     .call => 0xe8,
-        //     else => unreachable,
-        // };
-        // const encoder = try Encoder.init(emit.code, 5);
-        // encoder.opcode_1byte(opc);
-        // if (imm <= math.maxInt(i8)) {
-        //     encoder.imm8(@intCast(i8, imm));
-        // } else {
-        //     encoder.imm32(imm);
-        // }
-        return emit.fail("TODO implement emitting JMP/CALL inst/rel", .{});
+        const target = emit.mir.instructions.items(.data)[inst].inst;
+        const opc: u8 = switch (tag) {
+            .jmp => 0xe9,
+            .call => 0xe8,
+            else => unreachable,
+        };
+        const source = emit.code.items.len;
+        const encoder = try Encoder.init(emit.code, 5);
+        encoder.opcode_1byte(opc);
+        try emit.relocs.append(emit.bin_file.allocator, .{
+            .source = source,
+            .target = target,
+            .offset = emit.code.items.len,
+            .length = 5,
+        });
+        encoder.imm32(0x0);
+        return;
     }
     const modrm_ext: u3 = switch (tag) {
         .jmp => 0x4,
@@ -338,14 +377,14 @@ inline fn getCondOpCode(tag: Mir.Inst.Tag, cond: CondType) u8 {
             .cond_set_byte_greater_less => 0x96,
             else => unreachable,
         },
-        .ne => return switch (tag) {
+        .eq => return switch (tag) {
             .cond_jmp_eq_ne => 0x84,
-            .cond_set_byte_eq_ne => 0x95,
+            .cond_set_byte_eq_ne => 0x94,
             else => unreachable,
         },
-        .eq => return switch (tag) {
+        .ne => return switch (tag) {
             .cond_jmp_eq_ne => 0x85,
-            .cond_set_byte_eq_ne => 0x94,
+            .cond_set_byte_eq_ne => 0x95,
             else => unreachable,
         },
     }
@@ -353,11 +392,19 @@ inline fn getCondOpCode(tag: Mir.Inst.Tag, cond: CondType) u8 {
 
 fn mirCondJmp(emit: *Emit, tag: Mir.Inst.Tag, inst: Mir.Inst.Index) InnerError!void {
     const ops = Mir.Ops.decode(emit.mir.instructions.items(.ops)[inst]);
+    const target = emit.mir.instructions.items(.data)[inst].inst;
     const cond = CondType.fromTagAndFlags(tag, ops.flags);
     const opc = getCondOpCode(tag, cond);
+    const source = emit.code.items.len;
     const encoder = try Encoder.init(emit.code, 6);
     encoder.opcode_2byte(0x0f, opc);
-    return emit.fail("TODO implement emitting conditionals JNE inst/rel", .{});
+    try emit.relocs.append(emit.bin_file.allocator, .{
+        .source = source,
+        .target = target,
+        .offset = emit.code.items.len,
+        .length = 6,
+    });
+    encoder.imm32(0);
 }
 
 fn mirCondSetByte(emit: *Emit, tag: Mir.Inst.Tag, inst: Mir.Inst.Index) InnerError!void {
